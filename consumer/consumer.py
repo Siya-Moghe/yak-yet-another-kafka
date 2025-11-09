@@ -11,6 +11,8 @@ import logging
 class Colors:
     RESET = '\033[0m'
     BOLD = '\033[1m'
+    
+    # Regular colors
     RED = '\033[91m'
     GREEN = '\033[92m'
     YELLOW = '\033[93m'
@@ -18,11 +20,18 @@ class Colors:
     MAGENTA = '\033[95m'
     CYAN = '\033[96m'
     WHITE = '\033[97m'
+    
+    # Background colors
+    BG_RED = '\033[101m'
+    BG_GREEN = '\033[102m'
+    BG_YELLOW = '\033[103m'
 
 # ================================
 # Colored Logging Formatter
 # ================================
 class ColoredFormatter(logging.Formatter):
+    """Custom formatter to add colors to log messages"""
+    
     FORMATS = {
         logging.INFO: Colors.CYAN + "%(asctime)s" + Colors.RESET + " - " + 
                       Colors.GREEN + "%(levelname)s" + Colors.RESET + " - %(message)s",
@@ -36,13 +45,15 @@ class ColoredFormatter(logging.Formatter):
 
     def format(self, record):
         log_fmt = self.FORMATS.get(record.levelno, self.FORMATS[logging.INFO])
-        formatter = logging.Formatter(log_fmt)
+        formatter = logging.Formatter(log_fmt, datefmt='%H:%M:%S')
         return formatter.format(record)
 
 # Setup colored logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setFormatter(ColoredFormatter())
-logging.basicConfig(level=logging.INFO, handlers=[handler])
+logger.addHandler(handler)
 
 # ================================
 # Config
@@ -70,7 +81,7 @@ class ConsumerStorage:
         file_path = os.path.join(partition_dir, "messages.log")
         with open(file_path, "a") as f:
             f.write(json.dumps(message) + "\n")
-        logging.info(f"{Colors.MAGENTA}Stored message locally{Colors.RESET} for topic '{topic}' offset={message.get('offset')}")
+        logger.info(f"{Colors.MAGENTA}Stored message locally{Colors.RESET} for topic '{Colors.BOLD}{topic}{Colors.RESET}' offset={Colors.CYAN}{message.get('offset')}{Colors.RESET}")
 
     def read_all(self, topic):
         messages = []
@@ -111,7 +122,7 @@ class TopicConsumer:
                 leader_info = resp.json().get("leader", {})
                 if leader_info.get("host") and leader_info.get("port"):
                     self.leader = f"{leader_info['host']}:{leader_info['port']}"
-                    logging.info(f"{Colors.YELLOW}Leader discovered{Colors.RESET} for topic '{self.topic}' via {b} -> {self.leader}")
+                    logger.info(f"{Colors.YELLOW}Leader discovered{Colors.RESET} for topic '{Colors.BOLD}{self.topic}{Colors.RESET}' via {Colors.BLUE}{b}{Colors.RESET} → {Colors.GREEN}{self.leader}{Colors.RESET}")
                     return self.leader
             except Exception:
                 continue
@@ -119,7 +130,16 @@ class TopicConsumer:
         return self.leader
 
     def consume_loop(self):
-        logging.info(f"Starting consumer for topic '{self.topic}'")
+        print(f"\n{Colors.BOLD}{Colors.GREEN}{'='*60}{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.CYAN}YAK Consumer Started{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}{'='*60}{Colors.RESET}")
+        print(f"{Colors.CYAN}Topic:{Colors.RESET} {Colors.BOLD}{self.topic}{Colors.RESET}")
+        print(f"{Colors.CYAN}Brokers:{Colors.RESET} {Colors.YELLOW}{', '.join(self.brokers)}{Colors.RESET}")
+        print(f"{Colors.CYAN}Starting Offset:{Colors.RESET} {Colors.MAGENTA}{self.offset}{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}{'='*60}{Colors.RESET}\n")
+        
+        logger.info(f"{Colors.BLUE}Starting consumer loop{Colors.RESET} for topic '{Colors.BOLD}{self.topic}{Colors.RESET}'")
+        
         while True:
             if not self.leader:
                 self.discover_leader()
@@ -129,24 +149,28 @@ class TopicConsumer:
                 params = {"topic": self.topic, "offset": self.offset}
                 resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
                 data = resp.json()
-                
-                # Check if topic doesn't exist
-                if data.get("status") == "error":
-                    logging.error(f"{Colors.RED}Error from broker:{Colors.RESET} {data.get('message')}")
-                    logging.error(f"{Colors.RED}Topic '{self.topic}' does not exist. Exiting.{Colors.RESET}")
-                    return  # Exit the loop
-                
                 messages = data.get("messages", [])
                 hwm = data.get("hwm", 0)
 
                 if messages:
                     for msg in messages:
+                        # Print the actual message content in a nice format
+                        print(f"\n{Colors.BG_GREEN}{Colors.BOLD} NEW MESSAGE {Colors.RESET}")
+                        print(f"{Colors.CYAN}Offset:{Colors.RESET} {Colors.BOLD}{msg.get('offset')}{Colors.RESET}")
+                        print(f"{Colors.CYAN}Topic:{Colors.RESET} {Colors.BOLD}{self.topic}{Colors.RESET}")
+                        print(f"{Colors.CYAN}Content:{Colors.RESET} {Colors.WHITE}{msg.get('message', msg)}{Colors.RESET}")
+                        print(f"{Colors.GREEN}{'─'*50}{Colors.RESET}")
+                        
                         self.storage.append(self.topic, msg)
                         self.offset = msg.get("offset", self.offset) + 1
-                    logging.info(f"{Colors.GREEN}Consumed {len(messages)} messages{Colors.RESET}, next offset={self.offset}")
+                    
+                    logger.info(f"{Colors.GREEN}Consumed {Colors.BOLD}{len(messages)}{Colors.RESET}{Colors.GREEN} messages{Colors.RESET}, next offset={Colors.CYAN}{self.offset}{Colors.RESET}, HWM={Colors.MAGENTA}{hwm}{Colors.RESET}")
+                else:
+                    # Quiet poll - no new messages
+                    pass
 
             except requests.exceptions.RequestException as e:
-                logging.warning(f"Could not reach leader {self.leader} for topic '{self.topic}': {e}")
+                logger.warning(f"{Colors.RED}⚠ Could not reach leader{Colors.RESET} {Colors.YELLOW}{self.leader}{Colors.RESET} for topic '{Colors.BOLD}{self.topic}{Colors.RESET}': {e}")
                 self.leader = None  # force rediscovery next loop
 
             time.sleep(SLEEP_BETWEEN_POLL)
@@ -164,7 +188,11 @@ def main():
     brokers = [b.strip() for b in args.brokers.split(",") if b.strip()]
     storage = ConsumerStorage()
     consumer = TopicConsumer(brokers, args.topic, storage)
-    consumer.consume_loop()
+    
+    try:
+        consumer.consume_loop()
+    except KeyboardInterrupt:
+        print(f"\n\n{Colors.YELLOW}Consumer stopped gracefully{Colors.RESET}\n")
 
 
 if __name__ == "__main__":
