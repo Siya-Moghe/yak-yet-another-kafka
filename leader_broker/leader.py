@@ -22,31 +22,34 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 class CustomLogFormatter(logging.Formatter):
     RESET = "\033[0m"
     COLORS = {
-        "[INFO]": "\033[94m",
-        "[SUCCESS]": "\033[92m",
-        "[WARN]": "\033[33m",
-        "[ERROR]": "\033[91m",
-        "[SYNC]": "\033[96m",
-        "[ACK]": "\033[38;5;172m",
-        "[REPLICATED]": "\033[95m",
-        "[REDIRECT]": "\033[35m",
-        "[NEW]": "\033[38;5;220m",
-        "[LEASE]": "\033[90m",
-        "[REGISTERED]": "\033[38;5;208m"
-    }
+    "[INFO]": "\033[94m",            # Soft Blue — general info
+    "[SUCCESS]": "\033[92m",         # Muted Green — success / done
+    "[WARN]": "\033[33m",            # Amber — warm warning
+    "[ERROR]": "\033[91m",           # Red — errors
+    "[SYNC]": "\033[96m",            # Cyan — sync/communication
+    "[ACK]": "\033[38;5;172m",       # Copper / Bronze — unique acknowledgment tone
+    "[REPLICATED]": "\033[95m",      # Violet — replication
+    "[REDIRECT]": "\033[35m",        # Magenta — routing/redirection
+    "[NEW]": "\033[38;5;220m",       # Gold — new entries
+    "[LEASE]": "\033[90m",           # Gray — background / maintenance
+    "[REGISTERED]": "\033[38;5;208m" # Burnt Orange — registered node/action
+}
+
+
 
     def format(self, record):
         msg = super().format(record)
         for key, color in self.COLORS.items():
             if key in record.getMessage():
                 return f"{color}{msg}{self.RESET}"
+        # fallback: color based on level
         if record.levelno == logging.WARNING:
             return f"\033[93m{msg}{self.RESET}"
         elif record.levelno == logging.ERROR:
             return f"\033[91m{msg}{self.RESET}"
-        return msg
+        return msg  # default
 
-
+# Apply formatter to all handlers
 formatter = CustomLogFormatter("%(asctime)s - %(levelname)s - %(message)s")
 for handler in logging.getLogger().handlers:
     handler.setFormatter(formatter)
@@ -73,7 +76,7 @@ class MessageStorage:
 
     def read_all(self, topic):
         messages = []
-        partition_dir = os.path.join(self.base_dir, topic, "partition-0")
+        partition_dir = self._get_partition_dir(topic)
         file_path = os.path.join(partition_dir, "messages.log")
         if not os.path.exists(file_path):
             return messages
@@ -245,6 +248,7 @@ class BrokerNode:
             self.update_heartbeat()
             time.sleep(LEASE_TTL // 2)
 
+    # ===== HWM helpers =====
     def update_hwm(self, topic, offset):
         self.redis.set(f"yak:hwm:{topic}", offset)
 
@@ -259,23 +263,12 @@ class BrokerNode:
 broker_node = None
 
 # ===== API =====
-
 @app.post("/register_topic")
 async def register_topic(request: Request):
     data = await request.json()
     topic = data.get("topic")
     if not topic:
         return {"status": "error", "message": "Missing topic name"}
-
-    # ---- Only leader can register topics ----
-    if not broker_node.is_leader:
-        leader_info = broker_node.get_leader()
-        logger.info(f"[REDIRECT] Only leader can create topics. Redirecting to {leader_info}")
-        return {
-            "status": "redirect",
-            "message": "Only leader can register topics",
-            "leader": leader_info
-        }
 
     existing_topics = broker_node.storage.list_topics()
     if topic in existing_topics:
@@ -284,7 +277,7 @@ async def register_topic(request: Request):
     broker_node.storage._get_partition_dir(topic)
     broker_node.redis.set(f"yak:hwm:{topic}", 0)
     broker_node.redis.set(f"yak:offset:{topic}", 0)
-    logger.info(f"[NEW] Created new topic '{topic}' by leader broker {broker_node.broker_id}")
+
     return {"status": "ok", "topic": topic}
 
 
@@ -293,9 +286,7 @@ async def produce(request: Request):
     data = await request.json()
     topic = data.get("topic", "default")
 
-    # ---- Disallow topic auto-creation ----
     if topic not in broker_node.storage.list_topics():
-        logger.warning(f"[ERROR] Producer tried producing to unknown topic '{topic}'")
         return {"status": "error", "message": f"Topic '{topic}' not registered"}
 
     if not broker_node.is_leader:
@@ -319,8 +310,11 @@ async def produce(request: Request):
                     json={"topic": topic, "message": message_with_offset},
                     timeout=5,
                 )
-                if resp.status_code == 200:
+                logger.info(f"[REPLICATED] Replication response from {f['host']}:{f['port']} → {resp.json()}")
+                if resp.status_code == 200 and resp.json().get("status") == "replicated":
                     logger.info(f"[REPLICATED] Message offset={offset} replicated to {f['host']}:{f['port']}")
+                else:
+                    logger.warning(f"[WARNING] Replication failed to {f['host']}:{f['port']}")
             except Exception as e:
                 logger.warning(f"[WARNING] Replication exception to {f['host']}:{f['port']}: {e}")
 
@@ -329,17 +323,13 @@ async def produce(request: Request):
         "status": "ok",
         "topic": topic,
         "offset": offset,
-        "hwm": broker_node.get_hwm(topic)
+        "hwm": broker_node.get_hwm(topic),
+        "replicated_followers": len(followers)
     }
 
 
 @app.get("/consume")
 async def consume(topic: str = "default", offset: int = 0):
-    # ---- Consumers cannot create new topics ----
-    if topic not in broker_node.storage.list_topics():
-        logger.warning(f"[ERROR] Consumer tried consuming from unknown topic '{topic}'")
-        return {"status": "error", "message": f"Topic '{topic}' does not exist"}
-
     hwm = broker_node.get_hwm(topic)
     all_messages = broker_node.storage.read_all(topic)
     committed_messages = [m for m in all_messages if offset <= m.get("offset", 0) <= hwm]
@@ -349,22 +339,26 @@ async def consume(topic: str = "default", offset: int = 0):
 @app.post("/internal/replicate")
 async def internal_replicate(request: Request):
     data = await request.json()
-    topic = data.get("topic")
+    topic = data.get("topic", "default")
     message = data.get("message")
 
     if not message:
         return {"error": "Missing message content"}
 
-    # ---- Follower cannot auto-create topics ----
     if topic not in broker_node.storage.list_topics():
-        logger.warning(f"[ERROR] Replication received for unknown topic '{topic}' — ignoring")
-        return {"error": f"Unknown topic '{topic}'"}
+        broker_node.storage._get_partition_dir(topic)
+        broker_node.redis.set(f"yak:hwm:{topic}", 0)
+        broker_node.redis.set(f"yak:offset:{topic}", 0)
+        logger.info(f"[NEW] Auto-created topic '{topic}' on follower")
 
     offset = message.get("offset")
     existing_offsets = {m.get("offset") for m in broker_node.storage.read_all(topic)}
+
     if offset not in existing_offsets:
         broker_node.storage.append(message, topic=topic)
         logger.info(f"[REPLICATED] Message offset={offset} for topic '{topic}' to follower {broker_node.broker_id}")
+    else:
+        logger.info(f"[INFO] Message offset={offset} already exists, skipping")
 
     broker_node.redis.set(f"yak:follower_hwm:{broker_node.broker_id}:{topic}", offset)
     return {"status": "replicated", "topic": topic, "offset": offset}
@@ -373,16 +367,12 @@ async def internal_replicate(request: Request):
 @app.post("/internal/catchup")
 async def internal_catchup(request: Request):
     data = await request.json()
-    topic = data.get("topic")
+    topic = data.get("topic", "default")
     from_offset = data.get("from_offset", 0)
-
-    if topic not in broker_node.storage.list_topics():
-        return {"status": "error", "message": f"Unknown topic '{topic}'"}
-
     all_messages = broker_node.storage.read_all(topic)
     messages_to_send = [m for m in all_messages if m.get("offset", 0) > from_offset]
-    logger.info(f"[SYNC] Sending {len(messages_to_send)} messages for catch-up on topic '{topic}'")
-    return {"status": "ok", "topic": topic, "messages": messages_to_send}
+    logger.info(f"[SYNC] Sending {len(messages_to_send)} messages for catch-up on topic '{topic}' from offset {from_offset}")
+    return {"status": "ok", "topic": topic, "messages": messages_to_send, "count": len(messages_to_send)}
 
 
 @app.get("/metadata/leader")
@@ -405,7 +395,7 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--redis-host", type=str, required=True)
     parser.add_argument("--redis-port", type=int, default=6379)
-    parser.add_argument("--advertise-host", type=str)
+    parser.add_argument("--advertise-host", type=str, help="Externally reachable host/IP")
     args = parser.parse_args()
 
     global broker_node
