@@ -108,6 +108,8 @@ class TopicConsumer:
         self.storage = storage
         self.offset = self._load_offset()
         self.leader = None
+        self.first_poll = True  # Track if this is the first poll
+        self.topic_exists_warned = False  # Track if we've warned about topic
 
     def _load_offset(self):
         messages = self.storage.read_all(self.topic)
@@ -122,12 +124,16 @@ class TopicConsumer:
                 leader_info = resp.json().get("leader", {})
                 if leader_info.get("host") and leader_info.get("port"):
                     self.leader = f"{leader_info['host']}:{leader_info['port']}"
-                    logger.info(f"{Colors.YELLOW}Leader discovered{Colors.RESET} for topic '{Colors.BOLD}{self.topic}{Colors.RESET}' via {Colors.BLUE}{b}{Colors.RESET} → {Colors.GREEN}{self.leader}{Colors.RESET}")
+                    logger.info(f"{Colors.YELLOW}Leader discovered{Colors.RESET} via {Colors.BLUE}{b}{Colors.RESET} → {Colors.GREEN}{self.leader}{Colors.RESET}")
                     return self.leader
-            except Exception:
+            except Exception as e:
+                logger.warning(f"{Colors.RED}Failed to query broker{Colors.RESET} {Colors.YELLOW}{b}{Colors.RESET}: {e}")
                 continue
-        self.leader = self.brokers[0]
-        return self.leader
+        
+        # Could not find leader
+        logger.error(f"{Colors.RED}❌ Could not discover leader from any broker!{Colors.RESET}")
+        self.leader = None
+        return None
 
     def consume_loop(self):
         print(f"\n{Colors.BOLD}{Colors.GREEN}{'='*60}{Colors.RESET}")
@@ -141,8 +147,13 @@ class TopicConsumer:
         logger.info(f"{Colors.BLUE}Starting consumer loop{Colors.RESET} for topic '{Colors.BOLD}{self.topic}{Colors.RESET}'")
         
         while True:
+            # Discover leader if we don't have one
             if not self.leader:
-                self.discover_leader()
+                discovered = self.discover_leader()
+                if not discovered:
+                    logger.error(f"{Colors.RED}⚠ No leader available. Retrying in {SLEEP_BETWEEN_POLL}s...{Colors.RESET}")
+                    time.sleep(SLEEP_BETWEEN_POLL)
+                    continue
 
             try:
                 url = f"http://{self.leader}/consume"
@@ -153,12 +164,16 @@ class TopicConsumer:
                 hwm = data.get("hwm", 0)
 
                 if messages:
+                    # Reset warning flag since we got messages
+                    self.topic_exists_warned = False
+                    self.first_poll = False
+                    
                     for msg in messages:
                         # Print the actual message content in a nice format
                         print(f"\n{Colors.BG_GREEN}{Colors.BOLD} NEW MESSAGE {Colors.RESET}")
                         print(f"{Colors.CYAN}Offset:{Colors.RESET} {Colors.BOLD}{msg.get('offset')}{Colors.RESET}")
                         print(f"{Colors.CYAN}Topic:{Colors.RESET} {Colors.BOLD}{self.topic}{Colors.RESET}")
-                        print(f"{Colors.CYAN}Content:{Colors.RESET} {Colors.WHITE}{msg.get('message', msg)}{Colors.RESET}")
+                        print(f"{Colors.CYAN}Content:{Colors.RESET} {Colors.WHITE}{msg.get('msg', msg)}{Colors.RESET}")
                         print(f"{Colors.GREEN}{'─'*50}{Colors.RESET}")
                         
                         self.storage.append(self.topic, msg)
@@ -166,11 +181,20 @@ class TopicConsumer:
                     
                     logger.info(f"{Colors.GREEN}Consumed {Colors.BOLD}{len(messages)}{Colors.RESET}{Colors.GREEN} messages{Colors.RESET}, next offset={Colors.CYAN}{self.offset}{Colors.RESET}, HWM={Colors.MAGENTA}{hwm}{Colors.RESET}")
                 else:
-                    # Quiet poll - no new messages
-                    pass
+                    # No messages returned
+                    # Check if this is first poll and topic likely doesn't exist
+                    if self.first_poll and self.offset == 0 and hwm < 0:
+                        logger.warning(f"{Colors.YELLOW}⚠ Topic '{Colors.BOLD}{self.topic}{Colors.RESET}{Colors.YELLOW}' appears to be empty or does not exist{Colors.RESET} (offset=0, hwm={hwm})")
+                        self.topic_exists_warned = True
+                    elif self.first_poll and self.offset == 0:
+                        logger.warning(f"{Colors.YELLOW}⚠ Topic '{Colors.BOLD}{self.topic}{Colors.RESET}{Colors.YELLOW}' exists but has no messages yet{Colors.RESET} (waiting...)")
+                        self.topic_exists_warned = True
+                    # else: quiet poll, no logging spam
+                    
+                    self.first_poll = False
 
             except requests.exceptions.RequestException as e:
-                logger.warning(f"{Colors.RED}⚠ Could not reach leader{Colors.RESET} {Colors.YELLOW}{self.leader}{Colors.RESET} for topic '{Colors.BOLD}{self.topic}{Colors.RESET}': {e}")
+                logger.warning(f"{Colors.RED}⚠ Could not reach leader{Colors.RESET} {Colors.YELLOW}{self.leader}{Colors.RESET}: {e}")
                 self.leader = None  # force rediscovery next loop
 
             time.sleep(SLEEP_BETWEEN_POLL)
